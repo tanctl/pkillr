@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::TryFrom;
 
 use chrono::{DateTime, Utc};
 use nix::errno::Errno;
@@ -42,7 +43,45 @@ pub enum Signal {
     Sigsys,
 }
 
+const ALL_SIGNALS: [Signal; 31] = [
+    Signal::Sighup,
+    Signal::Sigint,
+    Signal::Sigquit,
+    Signal::Sigill,
+    Signal::Sigtrap,
+    Signal::Sigabrt,
+    Signal::Sigbus,
+    Signal::Sigfpe,
+    Signal::Sigkill,
+    Signal::Sigusr1,
+    Signal::Sigsegv,
+    Signal::Sigusr2,
+    Signal::Sigpipe,
+    Signal::Sigalrm,
+    Signal::Sigterm,
+    Signal::Sigstkflt,
+    Signal::Sigchld,
+    Signal::Sigcont,
+    Signal::Sigstop,
+    Signal::Sigtstp,
+    Signal::Sigttin,
+    Signal::Sigttou,
+    Signal::Sigurg,
+    Signal::Sigxcpu,
+    Signal::Sigxfsz,
+    Signal::Sigvtalrm,
+    Signal::Sigprof,
+    Signal::Sigwinch,
+    Signal::Sigio,
+    Signal::Sigpwr,
+    Signal::Sigsys,
+];
+
 impl Signal {
+    pub const fn all() -> &'static [Signal] {
+        &ALL_SIGNALS
+    }
+
     pub fn number(self) -> i32 {
         match self {
             Signal::Sighup => 1,

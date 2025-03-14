@@ -5,33 +5,8 @@ mod signals;
 mod ui;
 
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-pub enum SortField {
-    Cpu,
-    Mem,
-    Pid,
-    Name,
-}
-
-impl Default for SortField {
-    fn default() -> Self {
-        SortField::Cpu
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-pub enum Theme {
-    Pink,
-    Serious,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Theme::Pink
-    }
-}
+use clap::Parser;
+use config::{Config, SortField, Theme};
 
 #[derive(Debug, Parser)]
 #[command(name = "pkillr", about = "Interactive TUI process killer", version)]
@@ -59,6 +34,15 @@ pub struct Cli {
 
 fn main() -> Result<()> {
     let args = Cli::parse();
+    let config = Config {
+        theme: args.theme,
+        show_all_processes: args.all,
+        refresh_rate_ms: args.refresh_rate,
+        initial_filter: args.filter.clone(),
+        initial_sort: args.sort_by,
+        sort_descending: true,
+    };
     println!("{args:#?}");
+    println!("{config:#?}");
     Ok(())
 }
