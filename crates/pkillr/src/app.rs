@@ -3,6 +3,7 @@ use std::collections::{HashSet, VecDeque};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use nix::unistd::{Uid, User};
 
 use crate::config::{Config, SortField, Theme};
 use crate::process::{ProcessInfo, ProcessManager, matches_search};
@@ -111,12 +112,25 @@ pub struct App {
     needs_refresh: bool,
     paused: bool,
 
+    table_scroll_offset: usize,
+    current_username: String,
+    is_root: bool,
+    total_memory_bytes: u64,
+
     process_manager: ProcessManager,
     signal_sender: SignalSender,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
+        let current_uid = Uid::current();
+        let is_root = current_uid.as_raw() == 0;
+        let current_username = User::from_uid(current_uid)
+            .ok()
+            .flatten()
+            .map(|user| user.name)
+            .unwrap_or_else(|| "unknown".to_string());
+
         let mut app = Self {
             processes: Vec::new(),
             filtered_processes: Vec::new(),
@@ -137,6 +151,10 @@ impl App {
             signal_history: VecDeque::with_capacity(10),
             needs_refresh: true,
             paused: false,
+            table_scroll_offset: 0,
+            current_username,
+            is_root,
+            total_memory_bytes: 0,
             process_manager: ProcessManager::new(),
             signal_sender: SignalSender::new(),
         };
@@ -165,6 +183,12 @@ impl App {
         self.selected_pids
             .retain(|pid| self.filtered_processes.iter().any(|proc| proc.pid == *pid));
         self.clamp_selection();
+        if self.filtered_processes.is_empty() {
+            self.table_scroll_offset = 0;
+        } else {
+            let max_offset = self.filtered_processes.len().saturating_sub(1);
+            self.table_scroll_offset = self.table_scroll_offset.min(max_offset);
+        }
         self.needs_refresh = true;
     }
 
@@ -298,6 +322,14 @@ impl App {
         self.needs_refresh
     }
 
+    pub fn mode(&self) -> AppMode {
+        self.mode
+    }
+
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
     pub fn signal_history(&self) -> &VecDeque<SignalHistoryEntry> {
         &self.signal_history
     }
@@ -314,12 +346,42 @@ impl App {
         self.selected_index
     }
 
+    pub fn has_selection(&self) -> bool {
+        !self.selected_pids.is_empty()
+    }
+
+    pub fn is_pid_selected(&self, pid: u32) -> bool {
+        self.selected_pids.contains(&pid)
+    }
+
+    pub fn can_kill_without_privileges(&self, proc: &ProcessInfo) -> bool {
+        if proc.pid == 1 || proc.pid == std::process::id() {
+            return false;
+        }
+        if self.is_root {
+            return true;
+        }
+        proc.user == self.current_username
+    }
+
+    pub fn table_scroll_offset(&self) -> usize {
+        self.table_scroll_offset
+    }
+
+    pub fn set_table_scroll_offset(&mut self, offset: usize) {
+        self.table_scroll_offset = offset;
+    }
+
     pub fn status_message(&self) -> Option<&(String, StatusLevel)> {
         self.status_message.as_ref()
     }
 
     pub fn refresh_rate_ms(&self) -> u64 {
         self.refresh_rate_ms
+    }
+
+    pub fn total_memory_bytes(&self) -> u64 {
+        self.total_memory_bytes
     }
 
     fn handle_normal_input(&mut self, event: KeyEvent) -> Result<bool> {
@@ -440,6 +502,7 @@ impl App {
 
     fn refresh_process_data(&mut self) {
         self.processes = self.process_manager.get_processes(self.show_all_processes);
+        self.total_memory_bytes = self.process_manager.total_memory_bytes();
         self.selected_pids
             .retain(|pid| self.processes.iter().any(|proc| proc.pid == *pid));
         self.apply_filters();
@@ -475,8 +538,19 @@ impl App {
     fn clamp_selection(&mut self) {
         if self.filtered_processes.is_empty() {
             self.selected_index = 0;
+            self.table_scroll_offset = 0;
         } else if self.selected_index >= self.filtered_processes.len() {
             self.selected_index = self.filtered_processes.len() - 1;
+        }
+
+        if self.selected_index < self.table_scroll_offset {
+            self.table_scroll_offset = self.selected_index;
+        }
+
+        if let Some(last) = self.filtered_processes.len().checked_sub(1) {
+            if self.table_scroll_offset > last {
+                self.table_scroll_offset = last;
+            }
         }
     }
 

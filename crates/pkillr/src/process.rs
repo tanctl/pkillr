@@ -215,6 +215,10 @@ impl ProcessManager {
         self.username_cache.insert(uid, name.clone());
         name
     }
+
+    pub fn total_memory_bytes(&self) -> u64 {
+        self.system.total_memory() * 1_024
+    }
 }
 
 fn raw_uid(uid: &sysinfo::Uid) -> u32 {
