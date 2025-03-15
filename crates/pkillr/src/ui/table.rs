@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::app::{App, AppMode, StatusLevel};
 use crate::process::ProcessInfo;
+use crate::ui::{info_pane, signal_menu, tree_view};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let layout = Layout::default()
@@ -21,19 +22,29 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .split(area);
 
     render_header(frame, layout[0], app);
-    render_table(frame, layout[1], app);
+    if app.tree_view_open() {
+        tree_view::render(frame, layout[1], app);
+    } else {
+        render_table(frame, layout[1], app);
+    }
     render_status(frame, layout[2], app);
+
+    if app.signal_menu_open() {
+        signal_menu::render(frame, area, app);
+    }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let palette = app.theme().palette();
+    let mode_text = if app.is_info_pane_open() && matches!(app.mode(), AppMode::Normal) {
+        "INFO"
+    } else {
+        mode_label(app.mode())
+    };
     let mut spans = vec![
         Span::styled("pkillr", Style::default().fg(palette.table_header)),
         Span::raw(" | "),
-        Span::styled(
-            mode_label(app.mode()),
-            Style::default().fg(palette.text_normal),
-        ),
+        Span::styled(mode_text, Style::default().fg(palette.text_normal)),
         Span::raw(" | "),
         Span::styled(
             format!("{} processes", app.filtered_processes().len()),
@@ -54,8 +65,31 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_table(frame: &mut Frame, area: Rect, app: &mut App) {
+    let mut table_area = area;
+    let mut info_area = None;
+
+    if app.is_info_pane_open() {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+        table_area = chunks[0];
+        info_area = Some(chunks[1]);
+    }
+
+    render_process_list(frame, table_area, app);
+
+    if let Some(info_rect) = info_area {
+        info_pane::render(frame, info_rect, app);
+    }
+}
+
+fn render_process_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let palette = app.theme().palette();
-    let row_count = app.filtered_processes().len();
+    let row_count = {
+        let processes = app.filtered_processes();
+        processes.len()
+    };
     let visible_height = area.height.saturating_sub(3) as usize; // borders + header
     let selected_index = app.selected_index();
 
@@ -72,8 +106,12 @@ fn render_table(frame: &mut Frame, area: Rect, app: &mut App) {
     app.set_table_scroll_offset(offset);
 
     let processes = app.filtered_processes();
-    let end = min(offset + visible_height, row_count);
-    let displayed = &processes[offset..end];
+    let end = min(offset.saturating_add(visible_height), row_count);
+    let displayed = if offset >= end {
+        &processes[0..0]
+    } else {
+        &processes[offset..end]
+    };
 
     let header_cells = ["PID", "Name", "CPU%", "MEM%", "User", "Runtime"]
         .into_iter()
@@ -239,16 +277,30 @@ fn render_scrollbar(
 fn hints_for_mode(app: &App) -> String {
     match app.mode() {
         AppMode::Normal => {
-            if app.has_selection() {
+            let mut base = if app.has_selection() {
                 "Space toggle | Enter kill selected | k kill all".to_string()
             } else {
                 "/ search | i info | t tree | s signal | k kill | ? help | q quit".to_string()
+            };
+
+            if app.is_info_pane_open() {
+                base.push_str(" | Tab focus info");
+                if app.info_focus() {
+                    base.push_str(" (↑↓ scroll)");
+                }
+                base.push_str(" | e env | f files | n net | c cgroups");
             }
+
+            base
         }
         AppMode::Search => "Esc cancel | Enter apply | Type to filter…".to_string(),
-        AppMode::SignalMenu => "Esc cancel | ↑↓ choose | Enter send signal".to_string(),
+        AppMode::SignalMenu => {
+            "Esc cancel | ↑↓/jk navigate | 1-9 quick select | Enter send".to_string()
+        }
         AppMode::InfoPane => "Esc close info".to_string(),
-        AppMode::TreeView => "Esc close tree".to_string(),
+        AppMode::TreeView => {
+            "Esc close tree | ↑↓ navigate | Space collapse | x kill tree".to_string()
+        }
         AppMode::HistoryView => "Esc close history".to_string(),
     }
 }

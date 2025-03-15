@@ -1,4 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use fuzzy_matcher::FuzzyMatcher;
@@ -44,6 +47,25 @@ impl From<ProcessStatus> for ProcessState {
     }
 }
 
+impl ProcessState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProcessState::Running => "Running",
+            ProcessState::Sleeping => "Sleeping",
+            ProcessState::Stopped => "Stopped",
+            ProcessState::Zombie => "Zombie",
+            ProcessState::Idle => "Idle",
+            ProcessState::Dead => "Dead",
+            ProcessState::Tracing => "Tracing",
+            ProcessState::DiskSleep => "Disk Sleep",
+            ProcessState::Locked => "Locked",
+            ProcessState::Waking => "Waking",
+            ProcessState::Parked => "Parked",
+            ProcessState::Unknown => "Unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: u32,
@@ -55,6 +77,30 @@ pub struct ProcessInfo {
     pub cmdline: Vec<String>,
     pub parent_pid: Option<u32>,
     pub state: ProcessState,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChildProcess {
+    pub pid: u32,
+    pub name: String,
+    pub state: ProcessState,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessDetails {
+    pub pid: u32,
+    pub parent_pid: Option<u32>,
+    pub state: ProcessState,
+    pub thread_count: usize,
+    pub cmdline: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub environment: Vec<String>,
+    pub children: Vec<ChildProcess>,
+    pub capabilities: Vec<String>,
+    pub open_files: Vec<String>,
+    pub open_ports: Vec<String>,
+    pub cgroups: Vec<String>,
+    pub namespaces: Vec<String>,
 }
 
 pub struct ProcessManager {
@@ -173,6 +219,58 @@ impl ProcessManager {
         tree
     }
 
+    pub fn get_details(&mut self, pid: u32) -> Option<ProcessDetails> {
+        let sys_pid = Pid::from_u32(pid);
+        self.system.refresh_process(sys_pid);
+        let process = self.system.process(sys_pid)?;
+
+        let parent_pid = process.parent().map(|p| p.as_u32());
+        let state = ProcessState::from(process.status());
+        let thread_count = process.tasks().map(|tasks| tasks.len()).unwrap_or(1);
+        let cmdline = process.cmd().to_vec();
+        let cwd = process.cwd().map(|path| path.to_path_buf());
+        let environment = process.environ().to_vec();
+
+        let children = self
+            .system
+            .processes()
+            .iter()
+            .filter_map(|(child_pid, child)| {
+                if child.parent() == Some(sys_pid) {
+                    Some(ChildProcess {
+                        pid: child_pid.as_u32(),
+                        name: child.name().to_string(),
+                        state: ProcessState::from(child.status()),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let capabilities = read_capabilities(pid);
+        let open_files = read_open_files(pid);
+        let open_ports = read_open_ports(pid);
+        let cgroups = read_cgroups(pid);
+        let namespaces = read_namespaces(pid);
+
+        Some(ProcessDetails {
+            pid,
+            parent_pid,
+            state,
+            thread_count,
+            cmdline,
+            cwd,
+            environment,
+            children,
+            capabilities,
+            open_files,
+            open_ports,
+            cgroups,
+            namespaces,
+        })
+    }
+
     fn refresh_if_needed(&mut self) -> bool {
         let now = Instant::now();
         if now.duration_since(self.last_refresh) >= MINIMUM_CPU_UPDATE_INTERVAL {
@@ -231,6 +329,164 @@ fn normalize_cpu(value: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+#[cfg(target_os = "linux")]
+fn read_capabilities(pid: u32) -> Vec<String> {
+    let path = format!("/proc/{pid}/status");
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    reader
+        .lines()
+        .filter_map(|line| line.ok())
+        .filter(|line| line.starts_with("Cap"))
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_capabilities(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn read_open_files(pid: u32) -> Vec<String> {
+    let mut result = Vec::new();
+    let path = format!("/proc/{pid}/fd");
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return result,
+    };
+
+    for entry in entries.flatten() {
+        let fd = entry
+            .file_name()
+            .into_string()
+            .unwrap_or_else(|_| "?".to_string());
+        let target = fs::read_link(entry.path())
+            .map(|link| link.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "<permission denied>".to_string());
+        result.push(format!("fd {fd} -> {target}"));
+    }
+
+    result.sort();
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_open_files(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn read_open_ports(pid: u32) -> Vec<String> {
+    let mut entries = Vec::new();
+    for table in ["tcp", "tcp6"] {
+        let path = format!("/proc/{pid}/net/{table}");
+        if let Ok(file) = fs::File::open(path) {
+            for (index, line) in BufReader::new(file).lines().enumerate() {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(_) => continue,
+                };
+                if index == 0 || line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(parsed) = parse_tcp_line(&line) {
+                    entries.push(format!("{table}: {parsed}"));
+                }
+            }
+        }
+    }
+    entries
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_open_ports(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_tcp_line(line: &str) -> Option<String> {
+    let columns: Vec<&str> = line.split_whitespace().collect();
+    if columns.len() < 4 {
+        return None;
+    }
+    let local = columns[1];
+    let remote = columns[2];
+    let state = tcp_state_name(columns[3]);
+    Some(format!("{local} -> {remote} ({state})"))
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_state_name(code: &str) -> &'static str {
+    match code {
+        "01" => "ESTABLISHED",
+        "02" => "SYN-SENT",
+        "03" => "SYN-RECEIVED",
+        "04" => "FIN-WAIT-1",
+        "05" => "FIN-WAIT-2",
+        "06" => "TIME-WAIT",
+        "07" => "CLOSE",
+        "08" => "CLOSE-WAIT",
+        "09" => "LAST-ACK",
+        "0A" => "LISTEN",
+        "0B" => "CLOSING",
+        "0C" => "NEW-SYN-RECV",
+        _ => "UNKNOWN",
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tcp_state_name(_code: &str) -> &'static str {
+    "UNKNOWN"
+}
+
+#[cfg(target_os = "linux")]
+fn read_cgroups(pid: u32) -> Vec<String> {
+    let path = format!("/proc/{pid}/cgroup");
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    BufReader::new(file)
+        .lines()
+        .filter_map(|line| line.ok())
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_cgroups(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn read_namespaces(pid: u32) -> Vec<String> {
+    let mut entries = Vec::new();
+    let path = format!("/proc/{pid}/ns");
+    let dir = match fs::read_dir(path) {
+        Ok(dir) => dir,
+        Err(_) => return entries,
+    };
+    for entry in dir.flatten() {
+        let name = entry
+            .file_name()
+            .into_string()
+            .unwrap_or_else(|_| "?".to_string());
+        let target = fs::read_link(entry.path())
+            .map(|link| link.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "<permission denied>".to_string());
+        entries.push(format!("{name}: {target}"));
+    }
+    entries.sort();
+    entries
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_namespaces(_pid: u32) -> Vec<String> {
+    Vec::new()
 }
 
 fn visible_to_user(process: &Process, current_uid: NixUid) -> bool {
