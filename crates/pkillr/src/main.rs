@@ -5,7 +5,8 @@ mod signals;
 mod ui;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::builder::styling::{Styles, Style};
+use clap::{ColorChoice, CommandFactory, FromArgMatches, Parser};
 use config::{Config, SortField, Theme};
 
 #[derive(Debug, Parser)]
@@ -33,7 +34,11 @@ pub struct Cli {
 }
 
 fn main() -> Result<()> {
-    let args = Cli::parse();
+    let matches = Cli::command()
+        .color(ColorChoice::Always)
+        .styles(clap_styles())
+        .get_matches();
+    let args = Cli::from_arg_matches(&matches).expect("cli parse failure");
     let config = Config {
         theme: args.theme,
         show_all_processes: args.all,
@@ -45,4 +50,21 @@ fn main() -> Result<()> {
     println!("{args:#?}");
     println!("{config:#?}");
     Ok(())
+}
+
+fn clap_styles() -> Styles {
+    const HOT_PINK: (u8, u8, u8) = (255, 20, 147);
+
+    let style = Style::new().fg_color(Some(HOT_PINK.into()));
+
+    Styles::styled()
+        .header(style.bold())
+        .usage(style.bold())
+        .literal(style.bold())
+        .placeholder(style)
+        .valid(style.bold())
+        .invalid(style.bold())
+        .context(style)
+        .context_value(style)
+        .error(style.bold())
 }

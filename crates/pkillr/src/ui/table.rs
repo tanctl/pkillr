@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::app::{App, AppMode, StatusLevel};
 use crate::process::ProcessInfo;
-use crate::ui::{info_pane, signal_menu, tree_view};
+use crate::ui::{aux_views, info_pane, signal_menu, tree_view};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let layout = Layout::default()
@@ -31,6 +31,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 
     if app.signal_menu_open() {
         signal_menu::render(frame, area, app);
+    }
+    if app.history_popup_open() {
+        aux_views::render_signal_history(frame, area, app);
+    }
+    if app.help_popup_open() {
+        aux_views::render_help_popup(frame, area, app);
     }
 }
 
@@ -280,7 +286,8 @@ fn hints_for_mode(app: &App) -> String {
             let mut base = if app.has_selection() {
                 "Space toggle | Enter kill selected | k kill all".to_string()
             } else {
-                "/ search | i info | t tree | s signal | k kill | ? help | q quit".to_string()
+                "/ search | i info | t tree | s signal | k kill | h history | ? help | q quit"
+                    .to_string()
             };
 
             if app.is_info_pane_open() {
@@ -289,6 +296,10 @@ fn hints_for_mode(app: &App) -> String {
                     base.push_str(" (↑↓ scroll)");
                 }
                 base.push_str(" | e env | f files | n net | c cgroups");
+            }
+
+            if app.has_selection() {
+                base.push_str(" | h history | ? help");
             }
 
             base

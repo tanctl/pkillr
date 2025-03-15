@@ -127,6 +127,8 @@ pub struct App {
     signal_menu_selected: usize,
     signal_menu_scroll_offset: usize,
     signal_menu_target: Option<u32>,
+    history_popup_open: bool,
+    help_popup_open: bool,
 
     theme: Theme,
     refresh_rate_ms: u64,
@@ -184,6 +186,8 @@ impl App {
             signal_menu_selected: 0,
             signal_menu_scroll_offset: 0,
             signal_menu_target: None,
+            history_popup_open: false,
+            help_popup_open: false,
             theme: config.theme,
             refresh_rate_ms: config.refresh_rate_ms,
             status_message: None,
@@ -245,6 +249,13 @@ impl App {
     }
 
     pub fn handle_input(&mut self, event: KeyEvent) -> Result<bool> {
+        if self.help_popup_open {
+            return self.handle_help_popup_input(event);
+        }
+        if self.history_popup_open {
+            return self.handle_history_popup_input(event);
+        }
+
         let should_quit = match self.mode {
             AppMode::Search => self.handle_search_input(event)?,
             AppMode::SignalMenu => self.handle_signal_menu_input(event)?,
@@ -465,6 +476,14 @@ impl App {
         self.signal_menu_target
     }
 
+    pub fn history_popup_open(&self) -> bool {
+        self.history_popup_open
+    }
+
+    pub fn help_popup_open(&self) -> bool {
+        self.help_popup_open
+    }
+
     pub fn tree_view_open(&self) -> bool {
         self.tree_view_open
     }
@@ -653,6 +672,42 @@ impl App {
         self.needs_refresh = true;
     }
 
+    fn open_history_popup(&mut self) {
+        if self.history_popup_open {
+            return;
+        }
+        self.history_popup_open = true;
+        self.refresh_pause_state();
+        self.needs_refresh = true;
+    }
+
+    fn close_history_popup(&mut self) {
+        if !self.history_popup_open {
+            return;
+        }
+        self.history_popup_open = false;
+        self.refresh_pause_state();
+        self.needs_refresh = true;
+    }
+
+    fn open_help_popup(&mut self) {
+        if self.help_popup_open {
+            return;
+        }
+        self.help_popup_open = true;
+        self.refresh_pause_state();
+        self.needs_refresh = true;
+    }
+
+    fn close_help_popup(&mut self) {
+        if !self.help_popup_open {
+            return;
+        }
+        self.help_popup_open = false;
+        self.refresh_pause_state();
+        self.needs_refresh = true;
+    }
+
     fn send_signal_from_menu(&mut self, signal: Signal) {
         let target = self.signal_menu_target.or_else(|| {
             if self.tree_view_open {
@@ -686,6 +741,16 @@ impl App {
                 self.set_status(StatusLevel::Error, err);
             }
         }
+    }
+
+    fn handle_history_popup_input(&mut self, _event: KeyEvent) -> Result<bool> {
+        self.close_history_popup();
+        Ok(false)
+    }
+
+    fn handle_help_popup_input(&mut self, _event: KeyEvent) -> Result<bool> {
+        self.close_help_popup();
+        Ok(false)
     }
 
     pub fn toggle_tree_view(&mut self) {
@@ -742,6 +807,8 @@ impl App {
                 self.toggle_tree_collapse();
             }
             KeyCode::Char('x') => self.open_tree_kill_prompt(),
+            KeyCode::Char('h') => self.open_history_popup(),
+            KeyCode::Char('?') => self.open_help_popup(),
             KeyCode::Up => self.tree_select_prev(),
             KeyCode::Down => self.tree_select_next(),
             KeyCode::PageUp => {
@@ -1149,6 +1216,9 @@ impl App {
                 };
                 self.open_signal_menu(target);
             }
+            KeyCode::Char('h') => {
+                self.open_history_popup();
+            }
             KeyCode::Char('x') => self.kill_selected_with_tree(Signal::Sigterm),
             KeyCode::Char('k') => self.kill_selected(Signal::Sigterm),
             KeyCode::Char('K') => self.kill_selected(Signal::Sigkill),
@@ -1175,7 +1245,7 @@ impl App {
                 self.set_status(StatusLevel::Info, message);
             }
             KeyCode::Char('?') => {
-                self.set_status(StatusLevel::Info, "help not yet implemented");
+                self.open_help_popup();
             }
             KeyCode::Char(' ') => self.toggle_selection(),
             KeyCode::Enter => self.kill_selected(Signal::Sigterm),
@@ -1368,7 +1438,9 @@ impl App {
     }
 
     fn refresh_pause_state(&mut self) {
-        self.paused = matches!(self.mode, AppMode::Search | AppMode::SignalMenu);
+        self.paused = matches!(self.mode, AppMode::Search | AppMode::SignalMenu)
+            || self.history_popup_open
+            || self.help_popup_open;
     }
 
     fn set_status<T: Into<String>>(&mut self, level: StatusLevel, message: T) {
