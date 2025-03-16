@@ -20,8 +20,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let env_expanded = app.info_env_expanded();
     let files_expanded = app.info_files_expanded();
+    let maps_expanded = app.info_maps_expanded();
     let network_expanded = app.info_network_expanded();
     let cgroups_expanded = app.info_cgroups_expanded();
+
+    let has_selection = app.current_pid().is_some();
 
     if let Some(details) = app.process_details() {
         build_basic_section(&mut lines, &palette, details);
@@ -30,11 +33,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         build_capabilities_section(&mut lines, &palette, details);
         build_environment_section(&mut lines, &palette, env_expanded, details);
         build_open_files_section(&mut lines, &palette, files_expanded, details);
+        build_memory_map_section(&mut lines, &palette, maps_expanded, details);
         build_network_section(&mut lines, &palette, network_expanded, details);
         build_cgroup_section(&mut lines, &palette, cgroups_expanded, details);
     } else {
-        lines.push(Line::from("No process selected."));
-        lines.push(Line::from("Select a process to view details."));
+        if has_selection {
+            lines.push(Line::from("Process terminated or inaccessible."));
+        } else {
+            lines.push(Line::from("No process selected."));
+            lines.push(Line::from("Select a process to view details."));
+        }
     }
 
     if lines.is_empty() {
@@ -249,6 +257,37 @@ fn build_open_files_section(
         push_line(
             lines,
             Line::from(Span::styled("Open Files: (press f to expand)", label)),
+        );
+    }
+}
+
+fn build_memory_map_section(
+    lines: &mut Vec<Line>,
+    palette: &Palette,
+    expanded: bool,
+    details: &ProcessDetails,
+) {
+    push_blank_line(lines);
+    let label = label_style(palette);
+    if expanded {
+        push_line(
+            lines,
+            Line::from(Span::styled(
+                "Memory Map Segments (press m to collapse):",
+                label.add_modifier(Modifier::BOLD),
+            )),
+        );
+        if details.memory_maps.is_empty() {
+            push_line(lines, Line::from("  <unavailable>"));
+        } else {
+            for entry in &details.memory_maps {
+                push_line(lines, Line::from(format!("  {}", entry)));
+            }
+        }
+    } else {
+        push_line(
+            lines,
+            Line::from(Span::styled("Memory Maps: (press m to expand)", label)),
         );
     }
 }

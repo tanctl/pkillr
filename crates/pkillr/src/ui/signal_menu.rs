@@ -62,13 +62,39 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             let number = format!("{:>2}", signal.number());
             let name = format!("{:<8}", signal.name());
             let description = signal.description();
-            let line = Line::from(vec![
+            let dangerous = is_dangerous(*signal);
+            let name_style = if dangerous {
+                Style::default()
+                    .fg(palette.status_error)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.text_normal)
+            };
+            let description_style = if dangerous {
+                Style::default().fg(palette.status_warning)
+            } else {
+                Style::default().fg(palette.text_dim)
+            };
+
+            let mut spans = vec![
                 Span::styled(number, Style::default().fg(palette.text_dim)),
                 Span::raw("  "),
-                Span::styled(name, Style::default().fg(palette.text_normal)),
+                Span::styled(name, name_style),
                 Span::raw("  "),
-                Span::styled(description, Style::default().fg(palette.text_dim)),
-            ]);
+                Span::styled(description, description_style),
+            ];
+
+            if dangerous {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    "⚠",
+                    Style::default()
+                        .fg(palette.status_error)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            let line = Line::from(spans);
             ListItem::new(line)
         })
         .collect();
@@ -80,11 +106,17 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let list = List::new(items).highlight_style(highlight);
 
+    let title_text = if let Some(pid) = app.signal_menu_target() {
+        format!(" Select Signal (PID {}) ", pid)
+    } else {
+        " Select Signal ".to_string()
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette.table_border))
         .title(Line::from(Span::styled(
-            " Select Signal ",
+            title_text,
             Style::default()
                 .fg(palette.table_header)
                 .add_modifier(Modifier::BOLD),
@@ -106,8 +138,24 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     frame.render_stateful_widget(list, chunks[0], &mut state);
 
-    let hints = Paragraph::new("↑↓/jk navigate | Enter send | 1-9 select | Esc cancel")
-        .style(Style::default().fg(palette.text_dim))
-        .wrap(Wrap { trim: true });
+    let hints =
+        Paragraph::new("↑↓/jk navigate | Enter send | 1-9 select | Esc cancel | ⚠ dangerous")
+            .style(Style::default().fg(palette.text_dim))
+            .wrap(Wrap { trim: true });
     frame.render_widget(hints, chunks[1]);
+}
+
+fn is_dangerous(signal: Signal) -> bool {
+    matches!(
+        signal,
+        Signal::Sigkill
+            | Signal::Sigstop
+            | Signal::Sigabrt
+            | Signal::Sigbus
+            | Signal::Sigfpe
+            | Signal::Sigill
+            | Signal::Sigsegv
+            | Signal::Sigtrap
+            | Signal::Sigsys
+    )
 }

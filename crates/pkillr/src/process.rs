@@ -4,8 +4,6 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
 use nix::unistd::{Uid as NixUid, User};
 use sysinfo::{
     MINIMUM_CPU_UPDATE_INTERVAL, Pid, Process, ProcessRefreshKind, ProcessStatus, RefreshKind,
@@ -75,6 +73,8 @@ pub struct ProcessInfo {
     pub user: String,
     pub runtime: Duration,
     pub cmdline: Vec<String>,
+    pub cwd: Option<String>,
+    pub environment: Vec<String>,
     pub parent_pid: Option<u32>,
     pub state: ProcessState,
 }
@@ -101,6 +101,7 @@ pub struct ProcessDetails {
     pub open_ports: Vec<String>,
     pub cgroups: Vec<String>,
     pub namespaces: Vec<String>,
+    pub memory_maps: Vec<String>,
 }
 
 pub struct ProcessManager {
@@ -146,6 +147,10 @@ impl ProcessManager {
                     let memory_bytes = process.memory().saturating_mul(1_024);
                     let runtime = Duration::from_secs(process.run_time());
                     let cmdline = process.cmd().to_vec();
+                    let cwd = process
+                        .cwd()
+                        .map(|path| path.to_string_lossy().into_owned());
+                    let environment = process.environ().to_vec();
                     let parent_pid = process.parent().map(|p| p.as_u32());
                     let state = ProcessState::from(process.status());
                     let name = process.name().to_string();
@@ -155,6 +160,8 @@ impl ProcessManager {
                         memory_bytes,
                         runtime,
                         cmdline,
+                        cwd,
+                        environment,
                         parent_pid,
                         state,
                         name,
@@ -162,8 +169,18 @@ impl ProcessManager {
                     )
                 };
 
-                let (cpu_sample, memory_bytes, runtime, cmdline, parent_pid, state, name, user_uid) =
-                    snapshot;
+                let (
+                    cpu_sample,
+                    memory_bytes,
+                    runtime,
+                    cmdline,
+                    cwd,
+                    environment,
+                    parent_pid,
+                    state,
+                    name,
+                    user_uid,
+                ) = snapshot;
 
                 let cpu_percent = self.cpu_percent(pid_u32, cpu_sample, refreshed);
                 let user = user_uid
@@ -178,6 +195,8 @@ impl ProcessManager {
                     user,
                     runtime,
                     cmdline,
+                    cwd,
+                    environment,
                     parent_pid,
                     state,
                 };
@@ -253,6 +272,7 @@ impl ProcessManager {
         let open_ports = read_open_ports(pid);
         let cgroups = read_cgroups(pid);
         let namespaces = read_namespaces(pid);
+        let memory_maps = read_memory_maps(pid);
 
         Some(ProcessDetails {
             pid,
@@ -268,6 +288,7 @@ impl ProcessManager {
             open_ports,
             cgroups,
             namespaces,
+            memory_maps,
         })
     }
 
@@ -489,6 +510,30 @@ fn read_namespaces(_pid: u32) -> Vec<String> {
     Vec::new()
 }
 
+#[cfg(target_os = "linux")]
+fn read_memory_maps(pid: u32) -> Vec<String> {
+    const MAP_LIMIT: usize = 64;
+    let path = format!("/proc/{pid}/maps");
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let mut lines: Vec<String> = BufReader::new(file)
+        .lines()
+        .filter_map(|line| line.ok())
+        .take(MAP_LIMIT)
+        .collect();
+    if lines.len() == MAP_LIMIT {
+        lines.push("...".to_string());
+    }
+    lines
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_memory_maps(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
 fn visible_to_user(process: &Process, current_uid: NixUid) -> bool {
     let Some(uid) = process.user_id() else {
         return false;
@@ -535,20 +580,4 @@ pub fn can_kill(proc: &ProcessInfo) -> Result<(), String> {
 pub fn get_process_tree(pid: u32) -> Vec<ProcessInfo> {
     let mut manager = ProcessManager::new();
     manager.get_process_tree(pid)
-}
-
-pub fn matches_search(proc: &ProcessInfo, query: &str) -> bool {
-    let needle = query.trim();
-    if needle.is_empty() {
-        return true;
-    }
-
-    let matcher = SkimMatcherV2::default();
-    let haystack = if proc.cmdline.is_empty() {
-        proc.name.clone()
-    } else {
-        format!("{} {}", proc.name, proc.cmdline.join(" "))
-    };
-
-    matcher.fuzzy_match(&haystack, needle).is_some()
 }

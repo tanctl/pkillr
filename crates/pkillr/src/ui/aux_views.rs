@@ -26,7 +26,9 @@ pub fn render_signal_history(frame: &mut Frame, area: Rect, app: &App) {
             let header = format!("{}  {} ({})", ts, entry.process_name, entry.pid);
             lines.push(Line::from(Span::styled(
                 header,
-                Style::default().fg(palette.text_normal).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette.text_normal)
+                    .add_modifier(Modifier::BOLD),
             )));
 
             let status_color = if entry.result.is_ok() {
@@ -36,7 +38,7 @@ pub fn render_signal_history(frame: &mut Frame, area: Rect, app: &App) {
             };
             let status_text = match &entry.result {
                 Ok(_) => "Success".to_string(),
-                Err(err) => err.clone(),
+                Err(err) => app.friendly_error_message(err),
             };
 
             lines.push(Line::from(vec![
@@ -88,26 +90,64 @@ pub fn render_help_popup(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = Vec::new();
     lines.push(Line::default());
     lines.push(Line::from(Span::styled("NAVIGATION", heading)));
-    lines.push(Line::from(Span::styled("  ↑↓ j k    move selection", body)));
-    lines.push(Line::from(Span::styled("  g G       jump top/bottom", body)));
-    lines.push(Line::from(Span::styled("  < >       cycle sort column", body)));
+    lines.push(Line::from(Span::styled("  ↑↓ / j k  move selection", body)));
+    lines.push(Line::from(Span::styled(
+        "  g G       jump top/bottom",
+        body,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  < >       cycle sort column",
+        body,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Esc       close info/tree",
+        body,
+    )));
     lines.push(Line::default());
     lines.push(Line::from(Span::styled("ACTIONS", heading)));
     lines.push(Line::from(Span::styled("  /         fuzzy search", body)));
-    lines.push(Line::from(Span::styled("  Space     toggle multi-select", body)));
-    lines.push(Line::from(Span::styled("  Enter     kill (SIGTERM)", body)));
-    lines.push(Line::from(Span::styled("  k         kill selected", body)));
-    lines.push(Line::from(Span::styled("  K         force kill (SIGKILL)", body)));
-    lines.push(Line::from(Span::styled("  x         kill tree (preview)", body)));
+    lines.push(Line::from(Span::styled("  /^...$/  regex filter", body)));
+    lines.push(Line::from(Span::styled("  /killed  history filter", body)));
+    lines.push(Line::from(Span::styled(
+        "  Space     select / toggle",
+        body,
+    )));
+    lines.push(Line::from(Span::styled("  Enter/k   kill (SIGTERM)", body)));
+    lines.push(Line::from(Span::styled(
+        "  K         force kill (SIGKILL)",
+        body,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  x         kill tree (preview)",
+        body,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  s         open signal menu",
+        body,
+    )));
     lines.push(Line::default());
     lines.push(Line::from(Span::styled("VIEWS", heading)));
-    lines.push(Line::from(Span::styled("  i         info pane", body)));
-    lines.push(Line::from(Span::styled("  t         process tree", body)));
-    lines.push(Line::from(Span::styled("  s         signal menu", body)));
+    lines.push(Line::from(Span::styled(
+        "  i         toggle info pane",
+        body,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Tab       switch info focus",
+        body,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  e/f/m/n/c toggle info sections",
+        body,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  t         toggle process tree",
+        body,
+    )));
     lines.push(Line::from(Span::styled("  h         signal history", body)));
     lines.push(Line::default());
     lines.push(Line::from(Span::styled("  ?         this help", body)));
     lines.push(Line::from(Span::styled("  q         quit", body)));
+    lines.push(Line::from(Span::styled("  Ctrl+C    quit instantly", body)));
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "Press any key to close",

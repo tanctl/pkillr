@@ -1,13 +1,17 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nix::unistd::{Uid, User};
+use nix::unistd::{Uid, getppid};
 
 use crate::config::{Config, SortField, Theme};
-use crate::process::{ProcessDetails, ProcessInfo, ProcessManager, matches_search};
+use crate::process::{ProcessDetails, ProcessInfo, ProcessManager, can_kill, get_process_tree};
 use crate::signals::{Signal, SignalEvent, SignalSender};
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
+use regex::{Regex, RegexBuilder};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AppMode {
@@ -87,6 +91,18 @@ pub enum StatusLevel {
 
 pub type SignalHistoryEntry = SignalEvent;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum RiskLevel {
+    Elevated,
+    Critical,
+}
+
+#[derive(Debug, Clone)]
+pub struct RiskInfo {
+    pub level: RiskLevel,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct TreeRow {
     pub pid: u32,
@@ -100,6 +116,7 @@ pub struct TreeRow {
     pub has_children: bool,
     pub collapsed: bool,
     pub prefix: String,
+    pub risk: Option<RiskInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +124,38 @@ pub struct TreeKillPrompt {
     pub pid: u32,
     pub signal: Signal,
     pub lines: Vec<String>,
+    pub risk: Option<RiskInfo>,
+}
+
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone)]
+enum SearchMode {
+    Fuzzy(String),
+    Regex {
+        pattern: String,
+        flags: String,
+        matcher: Regex,
+    },
+    History(String),
+}
+
+#[derive(Debug, Clone)]
+struct SearchHit {
+    score: i64,
+    name_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum PendingKill {
+    Direct { targets: Vec<u32>, signal: Signal },
+    Tree { targets: Vec<u32>, signal: Signal },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum KillMode {
+    Direct,
+    Tree,
 }
 
 pub struct App {
@@ -127,8 +176,14 @@ pub struct App {
     signal_menu_selected: usize,
     signal_menu_scroll_offset: usize,
     signal_menu_target: Option<u32>,
+    shell_confirm: Option<PendingKill>,
     history_popup_open: bool,
     help_popup_open: bool,
+    search_pending: bool,
+    last_search_edit: Option<Instant>,
+    search_matches: HashMap<u32, Vec<usize>>,
+    search_scores: HashMap<u32, i64>,
+    mode_before_popup: Option<AppMode>,
 
     theme: Theme,
     refresh_rate_ms: u64,
@@ -142,6 +197,7 @@ pub struct App {
     info_focus: bool,
     info_env_expanded: bool,
     info_files_expanded: bool,
+    info_maps_expanded: bool,
     info_network_expanded: bool,
     info_cgroups_expanded: bool,
     info_details_cache: Option<(u32, ProcessDetails)>,
@@ -152,8 +208,8 @@ pub struct App {
     tree_collapsed: HashSet<u32>,
     tree_scroll_offset: usize,
     tree_kill_prompt: Option<TreeKillPrompt>,
-    current_username: String,
     is_root: bool,
+    parent_pid: u32,
     total_memory_bytes: u64,
 
     process_manager: ProcessManager,
@@ -164,11 +220,6 @@ impl App {
     pub fn new(config: Config) -> Self {
         let current_uid = Uid::current();
         let is_root = current_uid.as_raw() == 0;
-        let current_username = User::from_uid(current_uid)
-            .ok()
-            .flatten()
-            .map(|user| user.name)
-            .unwrap_or_else(|| "unknown".to_string());
 
         let mut app = Self {
             processes: Vec::new(),
@@ -186,8 +237,14 @@ impl App {
             signal_menu_selected: 0,
             signal_menu_scroll_offset: 0,
             signal_menu_target: None,
+            shell_confirm: None,
             history_popup_open: false,
             help_popup_open: false,
+            search_pending: false,
+            last_search_edit: None,
+            search_matches: HashMap::new(),
+            search_scores: HashMap::new(),
+            mode_before_popup: None,
             theme: config.theme,
             refresh_rate_ms: config.refresh_rate_ms,
             status_message: None,
@@ -198,6 +255,7 @@ impl App {
             info_focus: false,
             info_env_expanded: false,
             info_files_expanded: false,
+            info_maps_expanded: false,
             info_network_expanded: false,
             info_cgroups_expanded: false,
             info_details_cache: None,
@@ -207,8 +265,8 @@ impl App {
             tree_collapsed: HashSet::new(),
             tree_scroll_offset: 0,
             tree_kill_prompt: None,
-            current_username,
             is_root,
+            parent_pid: getppid().as_raw() as u32,
             total_memory_bytes: 0,
             process_manager: ProcessManager::new(),
             signal_sender: SignalSender::new(),
@@ -228,27 +286,170 @@ impl App {
 
     pub fn apply_filters(&mut self) {
         let mut data = self.processes.clone();
-        let query = self.search_query.trim();
-        if !query.is_empty() {
-            data.retain(|proc| matches_search(proc, query));
+        let raw_query = self.search_query.trim().to_string();
+        self.search_matches.clear();
+        self.search_scores.clear();
+
+        let mode = match Self::parse_search_mode(&raw_query) {
+            Ok(mode) => mode,
+            Err(err) => {
+                self.filtered_processes.clear();
+                self.selected_pids.clear();
+                self.table_scroll_offset = 0;
+                self.set_status(StatusLevel::Error, err);
+                self.invalidate_process_details();
+                self.search_pending = false;
+                self.last_search_edit = None;
+                self.needs_refresh = true;
+                return;
+            }
+        };
+
+        match &mode {
+            SearchMode::Fuzzy(query) => {
+                if !query.is_empty() {
+                    let matcher = SkimMatcherV2::default();
+                    data = data
+                        .into_iter()
+                        .filter_map(|proc| {
+                            fuzzy_match_process(&proc, query, &matcher).map(|hit| {
+                                if !hit.name_indices.is_empty() {
+                                    self.search_matches.insert(proc.pid, hit.name_indices);
+                                }
+                                self.search_scores.insert(proc.pid, hit.score);
+                                proc
+                            })
+                        })
+                        .collect();
+                }
+            }
+            SearchMode::Regex { matcher, .. } => {
+                let regex = matcher.clone();
+                data = data
+                    .into_iter()
+                    .filter_map(|proc| {
+                        regex_match_process(&proc, &regex).map(|hit| {
+                            if !hit.name_indices.is_empty() {
+                                self.search_matches.insert(proc.pid, hit.name_indices);
+                            }
+                            self.search_scores.insert(proc.pid, hit.score);
+                            proc
+                        })
+                    })
+                    .collect();
+            }
+            SearchMode::History(filter) => {
+                data = self.filter_by_history(data, filter);
+            }
         }
 
-        data.sort_by(|a, b| self.compare_processes(a, b));
+        let mut sort_by_score = !self.search_scores.is_empty();
+        if matches!(mode, SearchMode::Fuzzy(ref query) if query.is_empty()) {
+            sort_by_score = false;
+        }
+
+        if sort_by_score {
+            data.sort_by(|a, b| {
+                let score_a = self.search_scores.get(&a.pid).copied().unwrap_or(0);
+                let score_b = self.search_scores.get(&b.pid).copied().unwrap_or(0);
+                score_b
+                    .cmp(&score_a)
+                    .then_with(|| self.compare_processes(a, b))
+            });
+        } else {
+            data.sort_by(|a, b| self.compare_processes(a, b));
+        }
+
+        let previous_len = self.filtered_processes.len();
         self.filtered_processes = data;
         self.selected_pids
             .retain(|pid| self.filtered_processes.iter().any(|proc| proc.pid == *pid));
         self.clamp_selection();
         if self.filtered_processes.is_empty() {
             self.table_scroll_offset = 0;
+            let message = match mode {
+                SearchMode::Fuzzy(query) if query.is_empty() => "No processes found".to_string(),
+                SearchMode::Fuzzy(query) => format!("No matches for '{}'", query),
+                SearchMode::Regex { pattern, flags, .. } => {
+                    let rendered = if flags.is_empty() {
+                        format!("/{pattern}/")
+                    } else {
+                        format!("/{pattern}/{}", flags)
+                    };
+                    format!("No regex matches for {}", rendered)
+                }
+                SearchMode::History(filter) if filter.is_empty() => {
+                    "No recent signal history".to_string()
+                }
+                SearchMode::History(filter) => {
+                    format!("No history entries matching '{}'", filter)
+                }
+            };
+            self.set_status(StatusLevel::Info, message);
         } else {
             let max_offset = self.filtered_processes.len().saturating_sub(1);
             self.table_scroll_offset = self.table_scroll_offset.min(max_offset);
+            if previous_len == 0 {
+                match mode {
+                    SearchMode::Fuzzy(query) if !query.is_empty() => {
+                        let message = format!("Showing matches for '{}'", query);
+                        self.set_status(StatusLevel::Info, message);
+                    }
+                    SearchMode::Regex { pattern, flags, .. } => {
+                        let rendered = if flags.is_empty() {
+                            format!("/{pattern}/")
+                        } else {
+                            format!("/{pattern}/{}", flags)
+                        };
+                        let message = format!("Regex filter active: {}", rendered);
+                        self.set_status(StatusLevel::Info, message);
+                    }
+                    SearchMode::History(filter) => {
+                        let message = if filter.is_empty() {
+                            "Showing processes with recent signals".to_string()
+                        } else {
+                            format!("History filter active: '{}'", filter)
+                        };
+                        self.set_status(StatusLevel::Info, message);
+                    }
+                    _ => {}
+                }
+            }
         }
         self.invalidate_process_details();
+        self.search_pending = false;
+        self.last_search_edit = None;
         self.needs_refresh = true;
     }
 
+    pub fn tick(&mut self, now: Instant) {
+        if self.search_pending {
+            if let Some(last) = self.last_search_edit {
+                if now.saturating_duration_since(last) >= SEARCH_DEBOUNCE {
+                    self.apply_filters();
+                }
+            } else {
+                self.apply_filters();
+            }
+        }
+    }
+
+    fn mark_search_dirty(&mut self) {
+        self.search_pending = true;
+        self.last_search_edit = Some(Instant::now());
+        self.apply_filters();
+    }
+
+    fn flush_search_filters(&mut self) {
+        if self.search_pending {
+            self.apply_filters();
+        }
+    }
+
     pub fn handle_input(&mut self, event: KeyEvent) -> Result<bool> {
+        if let Some(result) = self.handle_shell_confirm_input(event)? {
+            return Ok(result);
+        }
         if self.help_popup_open {
             return self.handle_help_popup_input(event);
         }
@@ -298,78 +499,225 @@ impl App {
 
     pub fn kill_selected(&mut self, signal: Signal) {
         let targets = self.collect_target_pids();
-        if targets.is_empty() {
-            self.set_status(StatusLevel::Warning, "no process selected");
+        if !self.dispatch_signal_targets(targets, signal, KillMode::Direct, false) {
             return;
         }
-
-        let mut successes = Vec::new();
-        let mut errors = Vec::new();
-
-        for pid in targets {
-            match self.signal_sender.send_signal(pid, signal) {
-                Ok(_) => {
-                    successes.push(pid);
-                    self.selected_pids.remove(&pid);
-                }
-                Err(err) => errors.push((pid, err)),
-            }
-        }
-
-        self.update_signal_history();
-        self.force_refresh_processes();
-
-        if !successes.is_empty() {
-            let message = format!("sent {} to {} process(es)", signal.name(), successes.len());
-            self.set_status(StatusLevel::Info, message);
-        }
-
-        if let Some((pid, err)) = errors.first() {
-            let message = format!("failed to send {} to {}: {}", signal.name(), pid, err);
-            self.set_status(StatusLevel::Error, message);
-        }
-
-        self.invalidate_process_details();
     }
 
     pub fn kill_selected_with_tree(&mut self, signal: Signal) {
         let targets = self.collect_target_pids();
-        if targets.is_empty() {
-            self.set_status(StatusLevel::Warning, "no process selected");
+        if !self.dispatch_signal_targets(targets, signal, KillMode::Tree, false) {
             return;
         }
+    }
 
-        let mut successes = 0usize;
+    fn dispatch_signal_targets(
+        &mut self,
+        targets: Vec<u32>,
+        signal: Signal,
+        mode: KillMode,
+        allow_shell_override: bool,
+    ) -> bool {
+        if targets.is_empty() {
+            self.set_status(StatusLevel::Warning, "no process selected");
+            return false;
+        }
+
+        if !allow_shell_override && !self.is_root {
+            if targets.iter().any(|pid| *pid == self.parent_pid) {
+                self.shell_confirm = Some(match mode {
+                    KillMode::Direct => PendingKill::Direct { targets, signal },
+                    KillMode::Tree => PendingKill::Tree { targets, signal },
+                });
+                self.set_status(
+                    StatusLevel::Warning,
+                    format!(
+                        "This is your shell process (PID {}). Continue? (y/n)",
+                        self.parent_pid
+                    ),
+                );
+                self.needs_refresh = true;
+                self.refresh_pause_state();
+                return false;
+            }
+        }
+
+        let executed = match mode {
+            KillMode::Direct => self.dispatch_direct(targets, signal),
+            KillMode::Tree => self.dispatch_tree(targets, signal),
+        };
+
+        self.needs_refresh = true;
+        self.refresh_pause_state();
+        executed
+    }
+
+    fn dispatch_direct(&mut self, targets: Vec<u32>, signal: Signal) -> bool {
+        let mut successes = Vec::new();
         let mut errors = Vec::new();
 
         for pid in targets {
-            match self.signal_sender.kill_process_tree(pid, signal) {
-                Ok(killed) => {
-                    successes += killed.len();
+            let name = self
+                .process_name_for_pid(pid)
+                .unwrap_or_else(|| format!("PID {pid}"));
+            let risk = self.risk_for_pid(pid);
+            match self.signal_sender.send_signal(pid, signal) {
+                Ok(_) => {
+                    successes.push((pid, name, risk));
                     self.selected_pids.remove(&pid);
                 }
-                Err(err) => errors.push((pid, err)),
+                Err(err) => errors.push((pid, name, err)),
             }
         }
 
         self.update_signal_history();
         self.force_refresh_processes();
-
-        if successes > 0 {
-            let message = format!(
-                "sent {} with tree traversal to {} process(es)",
-                signal.name(),
-                successes
-            );
-            self.set_status(StatusLevel::Info, message);
-        }
-
-        if let Some((pid, err)) = errors.first() {
-            let message = format!("tree kill failed for {}: {}", pid, err);
-            self.set_status(StatusLevel::Error, message);
-        }
-
         self.invalidate_process_details();
+
+        if errors.is_empty() {
+            if !successes.is_empty() {
+                self.report_kill_success(&successes, signal);
+            }
+        } else {
+            let (_, _, err) = &errors[0];
+            self.report_kill_error(err);
+        }
+
+        !successes.is_empty() || !errors.is_empty()
+    }
+
+    fn dispatch_tree(&mut self, targets: Vec<u32>, signal: Signal) -> bool {
+        let mut total_killed = 0usize;
+        let mut errors = Vec::new();
+        let mut risk_notes = Vec::new();
+
+        for pid in targets {
+            if let Some(risk) = self.risk_for_pid(pid) {
+                risk_notes.push(risk);
+            }
+            match self.signal_sender.kill_process_tree(pid, signal) {
+                Ok(killed) => {
+                    total_killed += killed.len();
+                    self.selected_pids.remove(&pid);
+                }
+                Err(err) => {
+                    errors.push(err);
+                    break;
+                }
+            }
+        }
+
+        self.update_signal_history();
+        self.force_refresh_processes();
+        self.invalidate_process_details();
+
+        if errors.is_empty() {
+            if total_killed > 0 {
+                if let Some(risk) = risk_notes.iter().max_by_key(|info| info.level) {
+                    let mut level = match risk.level {
+                        RiskLevel::Critical => StatusLevel::Error,
+                        RiskLevel::Elevated => StatusLevel::Warning,
+                    };
+                    if level == StatusLevel::Info && is_dangerous_signal(signal) {
+                        level = StatusLevel::Warning;
+                    }
+                    let message = format!(
+                        "Killed process tree: {} processes terminated — caution: {}",
+                        total_killed, risk.reason
+                    );
+                    self.set_status(level, message);
+                } else {
+                    let mut level = StatusLevel::Info;
+                    if is_dangerous_signal(signal) {
+                        level = StatusLevel::Warning;
+                    }
+                    self.set_status(
+                        level,
+                        format!("Killed process tree: {} processes terminated", total_killed),
+                    );
+                }
+            }
+        } else if let Some(err) = errors.first() {
+            self.report_kill_error(err);
+        }
+
+        total_killed > 0 || !errors.is_empty()
+    }
+
+    fn report_kill_success(
+        &mut self,
+        successes: &[(u32, String, Option<RiskInfo>)],
+        signal: Signal,
+    ) {
+        if successes.is_empty() {
+            return;
+        }
+        let highest_risk = successes
+            .iter()
+            .filter_map(|(_, _, risk)| risk.as_ref())
+            .max_by_key(|info| info.level)
+            .cloned();
+        let base_level = highest_risk
+            .as_ref()
+            .map(|risk| match risk.level {
+                RiskLevel::Critical => StatusLevel::Error,
+                RiskLevel::Elevated => StatusLevel::Warning,
+            })
+            .unwrap_or(StatusLevel::Info);
+
+        let message = if successes.len() == 1 {
+            let (pid, name, _) = &successes[0];
+            if let Some(risk) = highest_risk {
+                format!(
+                    "Killed {} (PID {}) with {} — caution: {}",
+                    name,
+                    pid,
+                    signal.name(),
+                    risk.reason
+                )
+            } else {
+                format!("Killed {} (PID {}) with {}", name, pid, signal.name())
+            }
+        } else if let Some(risk) = highest_risk {
+            format!(
+                "Killed {} processes with {} — caution: {}",
+                successes.len(),
+                signal.name(),
+                risk.reason
+            )
+        } else {
+            format!(
+                "Killed {} processes with {}",
+                successes.len(),
+                signal.name()
+            )
+        };
+
+        let mut level = base_level;
+        if level == StatusLevel::Info && is_dangerous_signal(signal) {
+            level = StatusLevel::Warning;
+        }
+        self.set_status(level, message);
+    }
+
+    fn report_kill_error(&mut self, error: &str) {
+        let message = self.friendly_error_message(error);
+        self.set_status(StatusLevel::Error, message);
+    }
+
+    pub(crate) fn friendly_error_message(&self, error: &str) -> String {
+        let lowered = error.to_ascii_lowercase();
+        if lowered.contains("permission") {
+            "Permission denied. Run with sudo or select a user-owned process.".to_string()
+        } else if lowered.contains("pid 1") {
+            "Cannot kill init process".to_string()
+        } else if lowered.contains("pkillr") {
+            "Cannot kill pkillr itself".to_string()
+        } else if lowered.contains("shell") && lowered.contains("parent") {
+            "Refusing to kill your current shell".to_string()
+        } else {
+            error.to_string()
+        }
     }
 
     pub fn jump_to_top(&mut self) {
@@ -394,6 +742,18 @@ impl App {
         self.needs_refresh
     }
 
+    pub fn clear_refresh_flag(&mut self) {
+        self.needs_refresh = false;
+    }
+
+    pub fn request_redraw(&mut self) {
+        self.needs_refresh = true;
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
     pub fn mode(&self) -> AppMode {
         self.mode
     }
@@ -414,6 +774,12 @@ impl App {
         &self.filtered_processes
     }
 
+    pub fn highlight_indices(&self, pid: u32) -> Option<&[usize]> {
+        self.search_matches
+            .get(&pid)
+            .map(|indices| indices.as_slice())
+    }
+
     pub fn selected_index(&self) -> usize {
         self.selected_index
     }
@@ -427,13 +793,7 @@ impl App {
     }
 
     pub fn can_kill_without_privileges(&self, proc: &ProcessInfo) -> bool {
-        if proc.pid == 1 || proc.pid == std::process::id() {
-            return false;
-        }
-        if self.is_root {
-            return true;
-        }
-        proc.user == self.current_username
+        can_kill(proc).is_ok()
     }
 
     pub fn table_scroll_offset(&self) -> usize {
@@ -534,7 +894,30 @@ impl App {
         self.info_focus = false;
         self.info_pane_scroll = 0;
         self.invalidate_process_details();
-        self.needs_refresh = true;
+        let mut adjusted_mode = false;
+        if self.info_pane_open {
+            if !self.tree_view_open
+                && !matches!(
+                    self.mode,
+                    AppMode::Search | AppMode::SignalMenu | AppMode::InfoPane
+                )
+            {
+                self.set_mode(AppMode::InfoPane);
+                adjusted_mode = true;
+            }
+        } else if matches!(self.mode, AppMode::InfoPane) {
+            let next_mode = if self.tree_view_open {
+                AppMode::TreeView
+            } else {
+                AppMode::Normal
+            };
+            self.set_mode(next_mode);
+            adjusted_mode = true;
+        }
+
+        if !adjusted_mode {
+            self.needs_refresh = true;
+        }
     }
 
     pub fn info_pane_scroll(&self) -> u16 {
@@ -579,6 +962,19 @@ impl App {
             return;
         }
         self.info_files_expanded = !self.info_files_expanded;
+        self.info_pane_scroll = 0;
+        self.needs_refresh = true;
+    }
+
+    pub fn info_maps_expanded(&self) -> bool {
+        self.info_maps_expanded
+    }
+
+    pub fn toggle_info_maps(&mut self) {
+        if !self.info_pane_open {
+            return;
+        }
+        self.info_maps_expanded = !self.info_maps_expanded;
         self.info_pane_scroll = 0;
         self.needs_refresh = true;
     }
@@ -676,9 +1072,11 @@ impl App {
         if self.history_popup_open {
             return;
         }
+        if self.mode_before_popup.is_none() {
+            self.mode_before_popup = Some(self.mode);
+        }
         self.history_popup_open = true;
-        self.refresh_pause_state();
-        self.needs_refresh = true;
+        self.set_mode(AppMode::HistoryView);
     }
 
     fn close_history_popup(&mut self) {
@@ -686,13 +1084,15 @@ impl App {
             return;
         }
         self.history_popup_open = false;
-        self.refresh_pause_state();
-        self.needs_refresh = true;
+        self.restore_mode_after_overlay();
     }
 
     fn open_help_popup(&mut self) {
         if self.help_popup_open {
             return;
+        }
+        if self.mode_before_popup.is_none() {
+            self.mode_before_popup = Some(self.mode);
         }
         self.help_popup_open = true;
         self.refresh_pause_state();
@@ -704,8 +1104,38 @@ impl App {
             return;
         }
         self.help_popup_open = false;
-        self.refresh_pause_state();
-        self.needs_refresh = true;
+        self.restore_mode_after_overlay();
+    }
+
+    fn restore_mode_after_overlay(&mut self) {
+        if self.history_popup_open {
+            self.set_mode(AppMode::HistoryView);
+            return;
+        }
+
+        if self.shell_confirm.is_some() {
+            self.refresh_pause_state();
+            self.needs_refresh = true;
+            return;
+        }
+
+        if self.tree_view_open {
+            self.set_mode(AppMode::TreeView);
+            self.mode_before_popup = None;
+            return;
+        }
+
+        if self.info_pane_open && !matches!(self.mode, AppMode::Search | AppMode::SignalMenu) {
+            self.set_mode(AppMode::InfoPane);
+            self.mode_before_popup = None;
+        } else if let Some(previous) = self.mode_before_popup.take() {
+            self.set_mode(previous);
+        } else if !matches!(self.mode, AppMode::Search | AppMode::SignalMenu) {
+            self.set_mode(AppMode::Normal);
+        } else {
+            self.refresh_pause_state();
+            self.needs_refresh = true;
+        }
     }
 
     fn send_signal_from_menu(&mut self, signal: Signal) {
@@ -722,24 +1152,10 @@ impl App {
             self.close_signal_menu();
             return;
         };
-
-        let name = self
-            .process_name_for_pid(pid)
-            .unwrap_or_else(|| format!("PID {pid}"));
-
-        let result = self.signal_sender.send_signal(pid, signal);
+        let executed = self.dispatch_signal_targets(vec![pid], signal, KillMode::Direct, false);
         self.close_signal_menu();
-
-        match result {
-            Ok(()) => {
-                let message = format!("sent {} to {} (PID {pid})", signal.name(), name);
-                self.set_status(StatusLevel::Info, message);
-                self.force_refresh_processes();
-                self.update_signal_history();
-            }
-            Err(err) => {
-                self.set_status(StatusLevel::Error, err);
-            }
+        if executed {
+            self.invalidate_process_details();
         }
     }
 
@@ -809,6 +1225,8 @@ impl App {
             KeyCode::Char('x') => self.open_tree_kill_prompt(),
             KeyCode::Char('h') => self.open_history_popup(),
             KeyCode::Char('?') => self.open_help_popup(),
+            KeyCode::Char('j') => self.tree_select_next(),
+            KeyCode::Char('k') => self.tree_select_prev(),
             KeyCode::Up => self.tree_select_prev(),
             KeyCode::Down => self.tree_select_next(),
             KeyCode::PageUp => {
@@ -892,30 +1310,11 @@ impl App {
         };
 
         self.tree_kill_prompt = None;
-
-        match self
-            .signal_sender
-            .kill_process_tree(prompt.pid, prompt.signal)
-        {
-            Ok(killed) => {
-                let message = format!(
-                    "sent {} to {} process(es)",
-                    prompt.signal.name(),
-                    killed.len()
-                );
-                self.set_status(StatusLevel::Info, message);
-                self.force_refresh_processes();
-                if self.tree_view_open {
-                    self.rebuild_tree_nodes();
-                }
-            }
-            Err(err) => {
-                self.set_status(StatusLevel::Error, err);
-            }
+        let executed =
+            self.dispatch_signal_targets(vec![prompt.pid], prompt.signal, KillMode::Tree, true);
+        if executed && self.tree_view_open {
+            self.rebuild_tree_nodes();
         }
-
-        self.update_signal_history();
-        self.needs_refresh = true;
     }
 
     fn open_tree_kill_prompt(&mut self) {
@@ -931,6 +1330,7 @@ impl App {
             pid,
             signal: Signal::Sigterm,
             lines,
+            risk: self.risk_for_pid(pid),
         });
         self.needs_refresh = true;
     }
@@ -1046,6 +1446,7 @@ impl App {
 
         let mut total_cpu = info.cpu_percent;
         let mut total_mem = info.memory_bytes;
+        let risk = self.assess_risk(info);
 
         let row_index = rows.len();
         rows.push(TreeRow {
@@ -1060,6 +1461,7 @@ impl App {
             has_children,
             collapsed,
             prefix,
+            risk,
         });
 
         if let Some(child_list) = children.get(&pid) {
@@ -1111,7 +1513,10 @@ impl App {
     }
 
     fn build_tree_preview_lines(&mut self, pid: u32) -> Vec<String> {
-        let processes = self.process_manager.get_process_tree(pid);
+        let mut processes = self.process_manager.get_process_tree(pid);
+        if processes.is_empty() {
+            processes = get_process_tree(pid);
+        }
         if processes.is_empty() {
             return Vec::new();
         }
@@ -1159,7 +1564,7 @@ impl App {
         };
 
         let prefix = build_tree_prefix(stack);
-        let line = format!(
+        let mut line = format!(
             "{}[{}] {} [CPU: {:>5.1}%] [MEM: {}]",
             prefix,
             info.pid,
@@ -1167,6 +1572,13 @@ impl App {
             info.cpu_percent,
             format_bytes(info.memory_bytes)
         );
+        if let Some(risk) = self.assess_risk(info) {
+            let label = match risk.level {
+                RiskLevel::Critical => "CRITICAL",
+                RiskLevel::Elevated => "warn",
+            };
+            line.push_str(&format!(" [{}: {}]", label, risk.reason));
+        }
         lines.push(line);
 
         if let Some(child_list) = children.get(&pid) {
@@ -1181,8 +1593,20 @@ impl App {
     fn handle_normal_input(&mut self, event: KeyEvent) -> Result<bool> {
         match event.code {
             KeyCode::Char('q') => return Ok(true),
+            KeyCode::Esc => {
+                if self.is_info_pane_open() {
+                    self.toggle_info_pane();
+                } else {
+                    self.set_status(StatusLevel::Info, "Press q to quit or ? for help");
+                    self.needs_refresh = true;
+                }
+            }
             KeyCode::Char('/') => {
                 self.set_mode(AppMode::Search);
+                self.set_status(
+                    StatusLevel::Info,
+                    "Search mode: type to filter, Enter/Esc to exit".to_string(),
+                );
                 self.needs_refresh = true;
             }
             KeyCode::Char('i') => {
@@ -1193,16 +1617,19 @@ impl App {
                     self.toggle_info_focus();
                 }
             }
-            KeyCode::Char('e') if self.is_info_pane_open() => {
+            KeyCode::Char('e') | KeyCode::Char('E') if self.is_info_pane_open() => {
                 self.toggle_info_env();
             }
-            KeyCode::Char('f') if self.is_info_pane_open() => {
+            KeyCode::Char('f') | KeyCode::Char('F') if self.is_info_pane_open() => {
                 self.toggle_info_files();
             }
-            KeyCode::Char('n') if self.is_info_pane_open() => {
+            KeyCode::Char('m') | KeyCode::Char('M') if self.is_info_pane_open() => {
+                self.toggle_info_maps();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if self.is_info_pane_open() => {
                 self.toggle_info_network();
             }
-            KeyCode::Char('c') if self.is_info_pane_open() => {
+            KeyCode::Char('c') | KeyCode::Char('C') if self.is_info_pane_open() => {
                 self.toggle_info_cgroups();
             }
             KeyCode::Char('t') => {
@@ -1220,6 +1647,16 @@ impl App {
                 self.open_history_popup();
             }
             KeyCode::Char('x') => self.kill_selected_with_tree(Signal::Sigterm),
+            KeyCode::Char('k') if self.is_info_pane_open() && self.info_focus() => {
+                self.scroll_info_pane(-1);
+            }
+            KeyCode::Char('j') => {
+                if self.is_info_pane_open() && self.info_focus() {
+                    self.scroll_info_pane(1);
+                } else {
+                    self.select_next();
+                }
+            }
             KeyCode::Char('k') => self.kill_selected(Signal::Sigterm),
             KeyCode::Char('K') => self.kill_selected(Signal::Sigkill),
             KeyCode::Char('g') => self.jump_to_top(),
@@ -1281,21 +1718,26 @@ impl App {
     fn handle_search_input(&mut self, event: KeyEvent) -> Result<bool> {
         match event.code {
             KeyCode::Esc => {
+                self.flush_search_filters();
                 self.set_mode(AppMode::Normal);
             }
             KeyCode::Enter => {
+                self.flush_search_filters();
                 self.set_mode(AppMode::Normal);
             }
             KeyCode::Backspace => {
-                self.search_query.pop();
-                self.apply_filters();
+                if self.search_query.pop().is_some() {
+                    self.mark_search_dirty();
+                } else {
+                    self.needs_refresh = true;
+                }
             }
             KeyCode::Char(c)
                 if !event.modifiers.contains(KeyModifiers::CONTROL)
                     && !event.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.search_query.push(c);
-                self.apply_filters();
+                self.mark_search_dirty();
             }
             _ => {}
         }
@@ -1340,6 +1782,44 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    fn handle_shell_confirm_input(&mut self, event: KeyEvent) -> Result<Option<bool>> {
+        if self.shell_confirm.is_none() {
+            return Ok(None);
+        }
+
+        match event.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(pending) = self.shell_confirm.take() {
+                    match pending {
+                        PendingKill::Direct { targets, signal } => {
+                            self.dispatch_signal_targets(targets, signal, KillMode::Direct, true);
+                        }
+                        PendingKill::Tree { targets, signal } => {
+                            self.dispatch_signal_targets(targets, signal, KillMode::Tree, true);
+                        }
+                    }
+                }
+                self.refresh_pause_state();
+                Ok(Some(false))
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.shell_confirm = None;
+                self.set_status(StatusLevel::Info, "cancelled shell kill".to_string());
+                self.needs_refresh = true;
+                self.refresh_pause_state();
+                Ok(Some(false))
+            }
+            _ => {
+                self.set_status(
+                    StatusLevel::Warning,
+                    "Press y to continue or n to cancel".to_string(),
+                );
+                self.needs_refresh = true;
+                Ok(Some(false))
+            }
+        }
     }
 
     fn refresh_process_data(&mut self) {
@@ -1404,7 +1884,7 @@ impl App {
         }
     }
 
-    fn current_pid(&self) -> Option<u32> {
+    pub fn current_pid(&self) -> Option<u32> {
         self.filtered_processes
             .get(self.selected_index)
             .map(|proc| proc.pid)
@@ -1440,7 +1920,8 @@ impl App {
     fn refresh_pause_state(&mut self) {
         self.paused = matches!(self.mode, AppMode::Search | AppMode::SignalMenu)
             || self.history_popup_open
-            || self.help_popup_open;
+            || self.help_popup_open
+            || self.shell_confirm.is_some();
     }
 
     fn set_status<T: Into<String>>(&mut self, level: StatusLevel, message: T) {
@@ -1455,6 +1936,141 @@ impl App {
             deque.push_back(entry);
         }
         self.signal_history = deque;
+    }
+
+    fn parse_search_mode(query: &str) -> Result<SearchMode, String> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(SearchMode::Fuzzy(String::new()));
+        }
+
+        let lowered = trimmed.to_ascii_lowercase();
+        if lowered.starts_with("/killed") {
+            let remainder = if lowered.len() >= 7 {
+                &trimmed[7..]
+            } else {
+                ""
+            };
+            let filter = remainder.trim_start_matches([' ', ':']);
+            return Ok(SearchMode::History(filter.to_string()));
+        }
+
+        if trimmed.starts_with('/') {
+            if let Some(end) = trimmed.rfind('/') {
+                if end > 0 {
+                    let pattern = &trimmed[1..end];
+                    let flags = trimmed[end + 1..].to_string();
+                    let mut builder = RegexBuilder::new(pattern);
+                    if flags.contains('i') {
+                        builder.case_insensitive(true);
+                    }
+                    if flags.contains('m') {
+                        builder.multi_line(true);
+                    }
+                    if flags.contains('s') {
+                        builder.dot_matches_new_line(true);
+                    }
+                    let matcher = builder
+                        .build()
+                        .map_err(|err| format!("invalid regex: {err}"))?;
+                    return Ok(SearchMode::Regex {
+                        pattern: pattern.to_string(),
+                        flags,
+                        matcher,
+                    });
+                }
+            }
+        }
+
+        Ok(SearchMode::Fuzzy(trimmed.to_string()))
+    }
+
+    fn filter_by_history(&mut self, processes: Vec<ProcessInfo>, filter: &str) -> Vec<ProcessInfo> {
+        const HISTORY_WEIGHT: i64 = 1_000_000_000;
+        let filter_norm = filter.trim().to_ascii_lowercase();
+        let mut matched: HashMap<u32, usize> = HashMap::new();
+
+        for (idx, event) in self.signal_sender.history().enumerate() {
+            if event.result.is_err() {
+                continue;
+            }
+            if !filter_norm.is_empty() {
+                let signal_name = event.signal.name().to_ascii_lowercase();
+                let proc_name = event.process_name.to_ascii_lowercase();
+                if !signal_name.contains(&filter_norm) && !proc_name.contains(&filter_norm) {
+                    continue;
+                }
+            }
+            matched.entry(event.pid).or_insert(idx);
+        }
+
+        processes
+            .into_iter()
+            .filter_map(|proc| {
+                matched.get(&proc.pid).map(|order| {
+                    let highlights = full_match_indices(&proc.name);
+                    if !highlights.is_empty() {
+                        self.search_matches.insert(proc.pid, highlights);
+                    }
+                    let score = HISTORY_WEIGHT - (*order as i64);
+                    self.search_scores.insert(proc.pid, score);
+                    proc
+                })
+            })
+            .collect()
+    }
+
+    fn process_snapshot(&self, pid: u32) -> Option<ProcessInfo> {
+        self.processes
+            .iter()
+            .find(|proc| proc.pid == pid)
+            .cloned()
+            .or_else(|| {
+                self.filtered_processes
+                    .iter()
+                    .find(|proc| proc.pid == pid)
+                    .cloned()
+            })
+    }
+
+    fn risk_for_pid(&self, pid: u32) -> Option<RiskInfo> {
+        if let Some(info) = self.process_snapshot(pid) {
+            return self.assess_risk(&info);
+        }
+        self.tree_rows
+            .iter()
+            .find(|row| row.pid == pid)
+            .and_then(|row| row.risk.clone())
+    }
+
+    fn assess_risk(&self, info: &ProcessInfo) -> Option<RiskInfo> {
+        if info.pid == 1 {
+            return Some(RiskInfo {
+                level: RiskLevel::Critical,
+                reason: "init process".to_string(),
+            });
+        }
+        if info.pid == self.parent_pid {
+            return Some(RiskInfo {
+                level: RiskLevel::Critical,
+                reason: "current shell".to_string(),
+            });
+        }
+
+        let name = info.name.to_ascii_lowercase();
+        let mut result: Option<RiskInfo> = None;
+
+        for (pattern, level, reason) in CRITICAL_NAME_PATTERNS.iter() {
+            if name.contains(pattern) {
+                result = combine_risk(result, *level, reason);
+            }
+        }
+
+        if info.user == "root" {
+            result = combine_risk(result, RiskLevel::Elevated, "root-owned process");
+        }
+
+        result
     }
 }
 
@@ -1494,4 +2110,205 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} {}", value, UNITS[unit])
     }
+}
+
+const CRITICAL_NAME_PATTERNS: &[(&str, RiskLevel, &str)] = &[
+    ("systemd", RiskLevel::Critical, "system init"),
+    ("dbus-daemon", RiskLevel::Elevated, "dbus session"),
+    ("dbus-broker", RiskLevel::Elevated, "dbus broker"),
+    ("gnome-shell", RiskLevel::Critical, "desktop shell"),
+    ("plasmashell", RiskLevel::Critical, "desktop shell"),
+    ("kwin", RiskLevel::Critical, "window manager"),
+    ("mutter", RiskLevel::Critical, "window manager"),
+    ("sway", RiskLevel::Critical, "window manager"),
+    ("hyprland", RiskLevel::Critical, "window manager"),
+    ("wayfire", RiskLevel::Critical, "window manager"),
+    ("i3", RiskLevel::Critical, "window manager"),
+    ("xfce4-session", RiskLevel::Elevated, "desktop session"),
+    ("xorg", RiskLevel::Critical, "display server"),
+    ("xwayland", RiskLevel::Elevated, "display bridge"),
+    ("pipewire", RiskLevel::Elevated, "media service"),
+    ("pulseaudio", RiskLevel::Elevated, "audio server"),
+    ("tmux", RiskLevel::Elevated, "terminal multiplexer"),
+    ("wezterm", RiskLevel::Elevated, "terminal host"),
+    ("alacritty", RiskLevel::Elevated, "terminal host"),
+    ("kitty", RiskLevel::Elevated, "terminal host"),
+];
+
+fn combine_risk(current: Option<RiskInfo>, level: RiskLevel, reason: &str) -> Option<RiskInfo> {
+    match current {
+        Some(existing) if existing.level >= level => Some(existing),
+        _ => Some(RiskInfo {
+            level,
+            reason: reason.to_string(),
+        }),
+    }
+}
+
+const SCORE_NAME: i64 = 900_000;
+const SCORE_CAMEL: i64 = 880_000;
+const SCORE_CMDLINE: i64 = 700_000;
+const SCORE_CWD: i64 = 660_000;
+const SCORE_ENV: i64 = 640_000;
+const MAX_ENV_MATCHES: usize = 16;
+
+fn fuzzy_match_process(
+    proc: &ProcessInfo,
+    query: &str,
+    matcher: &SkimMatcherV2,
+) -> Option<SearchHit> {
+    let mut best_score: Option<i64> = None;
+    let mut name_indices: Vec<usize> = Vec::new();
+
+    if let Some((score, indices)) = matcher.fuzzy_indices(&proc.name, query) {
+        let weighted = SCORE_NAME + score;
+        best_score = Some(weighted);
+        name_indices = indices;
+    }
+
+    let camel = split_camel_case(&proc.name);
+    if !camel.is_empty() {
+        if let Some(score) = matcher.fuzzy_match(&camel, query) {
+            let weighted = SCORE_CAMEL + score;
+            if best_score.map_or(true, |current| weighted > current) {
+                best_score = Some(weighted);
+            }
+        }
+    }
+
+    if !proc.cmdline.is_empty() {
+        let cmdline = proc.cmdline.join(" ");
+        if let Some(score) = matcher.fuzzy_match(&cmdline, query) {
+            let weighted = SCORE_CMDLINE + score;
+            if best_score.map_or(true, |current| weighted > current) {
+                best_score = Some(weighted);
+            }
+        }
+    }
+
+    if let Some(cwd) = proc.cwd.as_ref() {
+        if let Some(score) = matcher.fuzzy_match(cwd, query) {
+            let weighted = SCORE_CWD + score;
+            if best_score.map_or(true, |current| weighted > current) {
+                best_score = Some(weighted);
+            }
+        }
+    }
+
+    for entry in proc.environment.iter().take(MAX_ENV_MATCHES) {
+        if let Some(score) = matcher.fuzzy_match(entry, query) {
+            let weighted = SCORE_ENV + score;
+            if best_score.map_or(true, |current| weighted > current) {
+                best_score = Some(weighted);
+            }
+        }
+    }
+
+    best_score.map(|score| SearchHit {
+        score,
+        name_indices,
+    })
+}
+
+fn regex_match_process(proc: &ProcessInfo, regex: &Regex) -> Option<SearchHit> {
+    let mut best_score: Option<i64> = None;
+    let mut name_indices: Vec<usize> = Vec::new();
+
+    if regex.is_match(&proc.name) {
+        name_indices = regex_indices(&proc.name, regex);
+        let weighted = SCORE_NAME + name_indices.len() as i64;
+        best_score = Some(weighted);
+    }
+
+    if !proc.cmdline.is_empty() {
+        let cmdline = proc.cmdline.join(" ");
+        if regex.is_match(&cmdline) {
+            let weighted = SCORE_CMDLINE + cmdline.len() as i64;
+            if best_score.map_or(true, |current| weighted > current) {
+                best_score = Some(weighted);
+            }
+        }
+    }
+
+    if let Some(cwd) = proc.cwd.as_ref() {
+        if regex.is_match(cwd) {
+            let weighted = SCORE_CWD + cwd.len() as i64;
+            if best_score.map_or(true, |current| weighted > current) {
+                best_score = Some(weighted);
+            }
+        }
+    }
+
+    for entry in proc.environment.iter().take(MAX_ENV_MATCHES) {
+        if regex.is_match(entry) {
+            let weighted = SCORE_ENV + entry.len() as i64;
+            if best_score.map_or(true, |current| weighted > current) {
+                best_score = Some(weighted);
+            }
+        }
+    }
+
+    best_score.map(|score| SearchHit {
+        score,
+        name_indices,
+    })
+}
+
+fn regex_indices(text: &str, regex: &Regex) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for mat in regex.find_iter(text) {
+        let start = mat.start();
+        let slice = &text[start..mat.end()];
+        for (offset, _) in slice.char_indices() {
+            indices.push(start + offset);
+        }
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn full_match_indices(text: &str) -> Vec<usize> {
+    text.char_indices().map(|(idx, _)| idx).collect()
+}
+
+fn split_camel_case(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+
+    let mut result = String::with_capacity(value.len() * 2);
+    let mut prev_lower_or_digit = false;
+
+    for ch in value.chars() {
+        if ch == '_' || ch == '-' {
+            result.push(' ');
+            prev_lower_or_digit = false;
+            continue;
+        }
+
+        if ch.is_uppercase() && prev_lower_or_digit {
+            result.push(' ');
+        }
+
+        result.push(ch);
+        prev_lower_or_digit = ch.is_lowercase() || ch.is_ascii_digit();
+    }
+
+    result
+}
+
+fn is_dangerous_signal(signal: Signal) -> bool {
+    matches!(
+        signal,
+        Signal::Sigkill
+            | Signal::Sigstop
+            | Signal::Sigabrt
+            | Signal::Sigbus
+            | Signal::Sigfpe
+            | Signal::Sigill
+            | Signal::Sigsegv
+            | Signal::Sigtrap
+            | Signal::Sigsys
+    )
 }

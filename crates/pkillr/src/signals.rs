@@ -281,11 +281,13 @@ impl SignalSender {
     }
 }
 
+#[allow(dead_code)]
 pub fn send_signal(pid: u32, signal: Signal) -> Result<(), String> {
     let mut manager = ProcessManager::new();
     send_signal_with_manager(&mut manager, pid, signal).map(|_| ())
 }
 
+#[allow(dead_code)]
 pub fn kill_process_tree(root_pid: u32, signal: Signal) -> Result<Vec<u32>, String> {
     let mut manager = ProcessManager::new();
     let mut events = Vec::new();

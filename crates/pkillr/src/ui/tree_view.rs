@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::{App, TreeKillPrompt, TreeRow};
+use crate::app::{App, RiskLevel, TreeKillPrompt, TreeRow};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let palette = app.theme().palette();
@@ -115,20 +115,63 @@ fn build_tree_line(app: &App, row: &TreeRow, is_selected: bool, in_subtree: bool
         format!("(PID {})", row.pid),
         Style::default().fg(palette.text_dim),
     ));
+    if let Some(parent) = row.parent_pid {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("← {}", parent),
+            Style::default().fg(palette.text_dim),
+        ));
+    }
+
+    let direct_cpu_color = app.theme().get_cpu_color(row.cpu_percent);
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
-        format!("[CPU: {:>5.1}%]", row.subtree_cpu),
-        Style::default().fg(app.theme().get_cpu_color(row.subtree_cpu)),
+        format!("[CPU: {:>5.1}%]", row.cpu_percent),
+        Style::default().fg(direct_cpu_color),
     ));
+    if (row.subtree_cpu - row.cpu_percent).abs() > 0.1 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("[Total: {:>5.1}%]", row.subtree_cpu),
+            Style::default().fg(app.theme().get_cpu_color(row.subtree_cpu)),
+        ));
+    }
+
+    let direct_mem_color = app.theme().get_memory_color(row.memory_bytes);
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
-        format!("[MEM: {}]", format_bytes(row.subtree_memory_bytes)),
-        Style::default().fg(app.theme().get_memory_color(row.subtree_memory_bytes)),
+        format!("[Mem: {}]", format_bytes(row.memory_bytes)),
+        Style::default().fg(direct_mem_color),
     ));
+    if row.subtree_memory_bytes > row.memory_bytes {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("[Total: {}]", format_bytes(row.subtree_memory_bytes)),
+            Style::default().fg(app.theme().get_memory_color(row.subtree_memory_bytes)),
+        ));
+    }
+
+    if let Some(risk) = &row.risk {
+        let (label, color) = match risk.level {
+            RiskLevel::Critical => ("CRITICAL", palette.status_error),
+            RiskLevel::Elevated => ("warn", palette.status_warning),
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("[{}: {}]", label, risk.reason.as_str()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
 
     let mut line = Line::from(spans);
     if is_selected {
         line.style = Style::default().bg(palette.highlight_selected);
+    } else if let Some(risk) = &row.risk {
+        let color = match risk.level {
+            RiskLevel::Critical => palette.status_error,
+            RiskLevel::Elevated => palette.status_warning,
+        };
+        line.style = Style::default().fg(color);
     } else if in_subtree {
         line.style = Style::default().fg(palette.text_dim);
     }
@@ -196,6 +239,23 @@ fn render_kill_prompt(
         content.push(Line::from(line.clone()));
     }
     content.push(Line::default());
+    if let Some(risk) = &prompt.risk {
+        let (label, color) = match risk.level {
+            RiskLevel::Critical => ("CRITICAL", palette.status_error),
+            RiskLevel::Elevated => ("warning", palette.status_warning),
+        };
+        content.push(Line::from(vec![
+            Span::styled(
+                "Risk: ",
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} — {}", label, risk.reason.as_str()),
+                Style::default().fg(color),
+            ),
+        ]));
+        content.push(Line::default());
+    }
     content.push(Line::from("Send SIGTERM? (y/n)"));
 
     let max_width = content

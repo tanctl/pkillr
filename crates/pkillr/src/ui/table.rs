@@ -1,4 +1,5 @@
 use std::cmp::{max, min};
+use std::collections::HashSet;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -8,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::app::{App, AppMode, StatusLevel};
-use crate::process::ProcessInfo;
+use crate::process::{self, ProcessInfo};
 use crate::ui::{aux_views, info_pane, signal_menu, tree_view};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -112,6 +113,26 @@ fn render_process_list(frame: &mut Frame, area: Rect, app: &mut App) {
     app.set_table_scroll_offset(offset);
 
     let processes = app.filtered_processes();
+    if row_count == 0 {
+        let message = if app.search_query().trim().is_empty() {
+            "No processes found".to_string()
+        } else {
+            format!("No matches for '{}'", app.search_query())
+        };
+        let paragraph = Paragraph::new(Line::from(Span::styled(
+            message,
+            Style::default().fg(palette.text_dim),
+        )))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette.table_border)),
+        );
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
     let end = min(offset.saturating_add(visible_height), row_count);
     let displayed = if offset >= end {
         &processes[0..0]
@@ -205,16 +226,33 @@ fn build_row(app: &App, proc: &ProcessInfo, is_selected: bool) -> Row<'static> {
     }
 
     let pid = format!("{:>8}", proc.pid);
+    let highlight_bytes = app.highlight_indices(proc.pid).unwrap_or(&[]);
+    let highlight_chars = highlight_char_positions(&proc.name, highlight_bytes);
 
-    let mut name_text = if app.is_pid_selected(proc.pid) {
-        format!("✓ {}", proc.name)
-    } else {
-        proc.name.clone()
-    };
-    if needs_sudo {
-        name_text.push_str(" [needs sudo]");
+    let mut sequence: Vec<(char, bool)> = Vec::new();
+    if app.is_pid_selected(proc.pid) {
+        sequence.push(('✓', false));
+        sequence.push((' ', false));
     }
-    let name = truncated_with_indicator(name_text, 20);
+    for (idx, ch) in proc.name.chars().enumerate() {
+        let highlight = highlight_chars.contains(&idx);
+        sequence.push((ch, highlight));
+    }
+    if needs_sudo || process::is_system_process(proc) {
+        for ch in " [needs sudo]".chars() {
+            sequence.push((ch, false));
+        }
+    }
+
+    let truncated_seq = truncate_sequence(&sequence, 20);
+    let name_spans = sequence_to_spans(
+        truncated_seq,
+        Style::default().fg(palette.text_normal),
+        Style::default()
+            .fg(palette.kill_accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let name_cell = Cell::from(Line::from(name_spans));
 
     let cpu = format!("{:>5.1}%", proc.cpu_percent);
     let mem = format!("{:>5.1}%", memory_percent(proc, app.total_memory_bytes()));
@@ -226,7 +264,7 @@ fn build_row(app: &App, proc: &ProcessInfo, is_selected: bool) -> Row<'static> {
 
     Row::new(vec![
         Cell::from(pid),
-        Cell::from(name),
+        name_cell,
         Cell::from(cpu).style(cpu_style),
         Cell::from(mem).style(mem_style),
         Cell::from(user),
@@ -283,36 +321,53 @@ fn render_scrollbar(
 fn hints_for_mode(app: &App) -> String {
     match app.mode() {
         AppMode::Normal => {
-            let mut base = if app.has_selection() {
-                "Space toggle | Enter kill selected | k kill all".to_string()
-            } else {
-                "/ search | i info | t tree | s signal | k kill | h history | ? help | q quit"
-                    .to_string()
-            };
+            let mut parts = vec!["↑↓/jk move", "g/G top/bot", "< > sort"];
 
             if app.is_info_pane_open() {
-                base.push_str(" | Tab focus info");
-                if app.info_focus() {
-                    base.push_str(" (↑↓ scroll)");
-                }
-                base.push_str(" | e env | f files | n net | c cgroups");
+                parts.push("Esc close info");
+                parts.push(if app.info_focus() {
+                    "Tab table"
+                } else {
+                    "Tab focus info"
+                });
+                parts.push("e/f/m/n/c toggle sections");
+            } else {
+                parts.push("i info");
             }
+
+            parts.push(if app.tree_view_open() {
+                "t table"
+            } else {
+                "t tree"
+            });
 
             if app.has_selection() {
-                base.push_str(" | h history | ? help");
+                parts.push("Space toggle");
+                parts.push("Enter/k kill");
+                parts.push("K sigkill");
+                parts.push("x tree kill");
+            } else {
+                parts.push("Space select");
+                parts.push("k kill current");
+                parts.push("s signal menu");
             }
 
-            base
+            parts.push("h history");
+            parts.push("? help");
+            parts.push("q quit");
+            parts.join(" | ")
         }
-        AppMode::Search => "Esc cancel | Enter apply | Type to filter…".to_string(),
-        AppMode::SignalMenu => {
-            "Esc cancel | ↑↓/jk navigate | 1-9 quick select | Enter send".to_string()
+        AppMode::Search => {
+            "Type to filter | /pattern/ regex | /killed history | Enter/Esc exit".to_string()
         }
-        AppMode::InfoPane => "Esc close info".to_string(),
+        AppMode::SignalMenu => "Esc cancel | ↑↓/jk navigate | 1-9 select | Enter send".to_string(),
+        AppMode::InfoPane => {
+            "Esc close info | Tab toggle focus | e/f/n/c expand sections".to_string()
+        }
         AppMode::TreeView => {
-            "Esc close tree | ↑↓ navigate | Space collapse | x kill tree".to_string()
+            "Esc close tree | ↑↓/jk move | Space collapse | x kill tree".to_string()
         }
-        AppMode::HistoryView => "Esc close history".to_string(),
+        AppMode::HistoryView => "Any key close history".to_string(),
     }
 }
 
@@ -335,16 +390,79 @@ fn truncated(value: &str, max_len: usize) -> String {
     }
 }
 
-fn truncated_with_indicator(value: String, max_len: usize) -> String {
-    if value.chars().count() <= max_len {
-        value
-    } else {
-        value
-            .chars()
-            .take(max_len.saturating_sub(1))
-            .collect::<String>()
-            + "…"
+fn highlight_char_positions(text: &str, byte_indices: &[usize]) -> HashSet<usize> {
+    if byte_indices.is_empty() {
+        return HashSet::new();
     }
+    let byte_set: HashSet<usize> = byte_indices.iter().copied().collect();
+    text.char_indices()
+        .enumerate()
+        .filter_map(|(idx, (byte_idx, _))| {
+            if byte_set.contains(&byte_idx) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn truncate_sequence(seq: &[(char, bool)], max_len: usize) -> Vec<(char, bool)> {
+    if seq.len() <= max_len {
+        return seq.to_vec();
+    }
+    if max_len == 0 {
+        return Vec::new();
+    }
+    let mut truncated = Vec::with_capacity(max_len);
+    for (index, item) in seq.iter().enumerate() {
+        if index >= max_len {
+            break;
+        }
+        truncated.push(*item);
+    }
+    if let Some(last) = truncated.last_mut() {
+        *last = ('…', false);
+    }
+    truncated
+}
+
+fn sequence_to_spans(
+    seq: Vec<(char, bool)>,
+    base_style: Style,
+    highlight_style: Style,
+) -> Vec<Span<'static>> {
+    if seq.is_empty() {
+        return vec![Span::styled(String::new(), base_style)];
+    }
+
+    let mut spans = Vec::new();
+    let mut buffer = String::new();
+    let mut active: Option<bool> = None;
+
+    for (ch, highlight) in seq {
+        match active {
+            Some(state) if state == highlight => buffer.push(ch),
+            Some(state) => {
+                let style = if state { highlight_style } else { base_style };
+                spans.push(Span::styled(buffer.clone(), style));
+                buffer.clear();
+                buffer.push(ch);
+                active = Some(highlight);
+            }
+            None => {
+                buffer.push(ch);
+                active = Some(highlight);
+            }
+        }
+    }
+
+    if let Some(state) = active {
+        let style = if state { highlight_style } else { base_style };
+        spans.push(Span::styled(buffer, style));
+    }
+
+    spans
 }
 
 fn memory_percent(proc: &ProcessInfo, total_memory_bytes: u64) -> f32 {
